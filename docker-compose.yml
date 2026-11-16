@@ -1,0 +1,17 @@
+# Sobe o assistente:  docker compose up -d --build
+# Ver o QR code e as mensagens:  docker compose logs -f
+services:
+  assistente:
+    build: .
+    env_file: .env
+    volumes:
+      - estado:/app/estado   # sessão do WhatsApp + tarefas/lembretes (não se perde ao atualizar)
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  estado:
