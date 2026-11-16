@@ -41,8 +41,12 @@ A sessão e os dados ficam no volume `estado` do Docker: atualizar ou reiniciar 
 |---|---|
 | Ver o que está acontecendo | `docker compose logs -f` |
 | Reiniciar (depois de mudar o `.env`) | `docker compose up -d --force-recreate` |
-| Atualizar o código | `git pull && docker compose up -d --build` |
+| Atualizar o código | automático pelo GitHub Actions, ou `bash scripts/deploy.sh` |
 | Gerar QR de novo (sessão encerrada) | `docker compose down && docker volume rm assistente-wpp_estado && docker compose up -d` |
+
+### Deploy automático
+
+Todo push na `main` dispara o GitHub Actions (`.github/workflows/deploy.yml`), que entra na VPS e roda `scripts/deploy.sh`. Usa os secrets `VPS_HOST`, `VPS_USER` e `VPS_SSH_KEY` (chave própria deste repositório, restrita na VPS a rodar só o deploy). Sem os secrets, o workflow apenas pula o deploy.
 
 ## 3. Rodar no PC (Node.js)
 
@@ -100,5 +104,4 @@ Adicione `,numero:Nome` no fim da linha `USUARIOS` do `.env` e reinicie (`docker
 - Entender **áudios** (transcrição)
 - Integração com **email** (Gmail/Outlook)
 - Integração com o **app da escola**, com aprovação antes de responder os pais
-- Deploy automático na VPS pelo GitHub Actions
 - Canal do **Telegram**
