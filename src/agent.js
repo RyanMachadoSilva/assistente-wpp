@@ -9,6 +9,10 @@ const MODELO =
   process.env.MODELO || (PROVEDOR === 'gemini' ? 'gemini-3.5-flash-lite' : 'claude-sonnet-5-5');
 // Modelo usado para entender áudios (sempre Gemini, mesmo com PROVEDOR=anthropic).
 const MODELO_AUDIO = process.env.MODELO_AUDIO || (PROVEDOR === 'gemini' ? MODELO : 'gemini-3.5-flash-lite');
+// Modelo de reserva: usado na hora quando o principal está congestionado (503), sem cota (429) ou demorando.
+const MODELO_RESERVA = process.env.MODELO_RESERVA ?? 'gemini-3.5-flash-lite';
+const ESPERA_PRINCIPAL_MS = Number(process.env.ESPERA_PRINCIPAL_S || 25) * 1000;
+const PAUSA_PRINCIPAL_MS = 10 * 60_000; // depois de uma falha, usa a reserva direto por 10 min
 // Quanto o Gemini "pensa" antes de responder: minimal, low, medium ou high. Menos = mais rápido.
 const PENSAMENTO = (process.env.PENSAMENTO ?? 'low').trim().toLowerCase();
 const MAX_HISTORICO = 30; // mensagens guardadas por conversa (pares usuário/assistente)
@@ -355,7 +359,23 @@ function configPensamento(modelo) {
   return { thinkingLevel: PENSAMENTO };
 }
 
+// Tenta o modelo pedido; se estiver congestionado, responde com o modelo de reserva.
+const pausados = new Map(); // modelo -> até quando usar a reserva no lugar dele
 async function chamarGemini(corpo, modelo = MODELO) {
+  const reserva = PROVEDOR === 'gemini' || modelo === MODELO_AUDIO ? MODELO_RESERVA : '';
+  if (!reserva || reserva === modelo) return chamarModelo(corpo, modelo, 90_000);
+  if ((pausados.get(modelo) || 0) > Date.now()) return chamarModelo(corpo, reserva, 90_000);
+  try {
+    return await chamarModelo(corpo, modelo, ESPERA_PRINCIPAL_MS);
+  } catch (e) {
+    if (![429, 500, 503, 504].includes(e.status)) throw e;
+    console.log(`[aviso] ${modelo} indisponível (${e.message}); usando ${reserva} pelos próximos 10 min.`);
+    pausados.set(modelo, Date.now() + PAUSA_PRINCIPAL_MS);
+    return chamarModelo(corpo, reserva, 90_000);
+  }
+}
+
+async function chamarModelo(corpo, modelo, esperaMs) {
   const url = `https://generativelanguage.googleapis.com/v1beta/models/${modelo}:generateContent`;
   const pensamento = configPensamento(modelo);
   const body = pensamento
@@ -367,10 +387,10 @@ async function chamarGemini(corpo, modelo = MODELO) {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'x-goog-api-key': process.env.GEMINI_API_KEY },
       body: JSON.stringify(body),
-      signal: AbortSignal.timeout(90_000), // não fica travado esperando para sempre
+      signal: AbortSignal.timeout(esperaMs), // não fica travado esperando para sempre
     });
   } catch (e) {
-    if (e.name === 'TimeoutError') throw new ErroIA(504, 'Gemini demorou mais de 90s para responder');
+    if (e.name === 'TimeoutError') throw new ErroIA(504, `Gemini demorou mais de ${esperaMs / 1000}s para responder`);
     throw e;
   }
   const json = await r.json().catch(() => ({}));
@@ -379,7 +399,7 @@ async function chamarGemini(corpo, modelo = MODELO) {
     if (r.status === 400 && pensamento && /think/i.test(msg)) {
       console.log(`[aviso] ${modelo} não aceita PENSAMENTO=${PENSAMENTO}; seguindo sem essa configuração.`);
       semPensamento.add(modelo);
-      return chamarGemini(corpo, modelo);
+      return chamarModelo(corpo, modelo, esperaMs);
     }
     throw new ErroIA(r.status, `Gemini ${r.status}: ${msg}`);
   }
