@@ -3,36 +3,21 @@ import 'dotenv/config'; // precisa ser o primeiro import: carrega o .env antes d
 import * as baileys from '@whiskeysockets/baileys';
 import pino from 'pino';
 import qrcode from 'qrcode-terminal';
-import { responder, resumoDoDia, PROVEDOR } from './agent.js';
+import { responder, resumoDoDia, transcrever, configurarEnvio, PROVEDOR } from './agent.js';
+import { USUARIOS, normalizar } from './usuarios.js';
 import { iniciarAgendador } from './scheduler.js';
 import { save, usuario } from './db.js';
 
 process.env.TZ ||= 'America/Sao_Paulo';
 
 const makeWASocket = baileys.makeWASocket ?? baileys.default;
-const { useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion } = baileys;
+const { useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion, downloadMediaMessage } = baileys;
+const silencioso = pino({ level: 'silent' });
 
 const MODO_PROPRIO = process.env.MODO_PROPRIO === 'true';
 
 // ---------- Quem pode falar com o assistente ----------
-// Números BR às vezes aparecem sem o 9 extra (55 34 9xxxx-xxxx -> 55 34 xxxx-xxxx). Normaliza para comparar.
-function normalizar(numero) {
-  const n = String(numero).replace(/\D/g, '');
-  if (n.startsWith('55') && n.length === 13 && n[4] === '9') return n.slice(0, 4) + n.slice(5);
-  return n;
-}
 const numeroDoJid = (jid) => normalizar(String(jid).split('@')[0].split(':')[0]);
-
-// USUARIOS=5534999999999:Ryan,5534988888888:Ana   (número:nome, separados por vírgula)
-// Compatível com o formato antigo DONO_NUMEROS + NOME_USUARIO.
-function lerUsuarios() {
-  const lista = (process.env.USUARIOS || process.env.DONO_NUMEROS || '').split(',').map((s) => s.trim()).filter(Boolean);
-  return lista.map((item) => {
-    const [numero, nome] = item.split(':');
-    return { numero: normalizar(numero), nome: (nome || process.env.NOME_USUARIO || 'usuário').trim() };
-  });
-}
-const USUARIOS = lerUsuarios();
 
 function jidsDaMensagem(m) {
   const k = m.key;
@@ -45,9 +30,19 @@ function identificar(m) {
   return USUARIOS.find((u) => numeros.includes(u.numero)) || null;
 }
 
+const conteudo = (m) => m.message?.ephemeralMessage?.message ?? m.message?.viewOnceMessage?.message ?? m.message;
+
 function textoDa(m) {
-  const msg = m.message?.ephemeralMessage?.message ?? m.message;
+  const msg = conteudo(m);
   return msg?.conversation || msg?.extendedTextMessage?.text || msg?.imageMessage?.caption || null;
+}
+
+const MAX_AUDIO_SEG = 10 * 60; // áudios maiores que 10 min são recusados
+
+/** Baixa o áudio do WhatsApp e devolve o texto falado. */
+async function textoDoAudio(m, audio) {
+  const buffer = await downloadMediaMessage(m, 'buffer', {}, { logger: silencioso, reuploadRequest: sock.updateMediaMessage });
+  return transcrever(buffer, audio.mimetype || 'audio/ogg');
 }
 
 // ---------- Fila por conversa (responde uma mensagem de cada vez) ----------
@@ -72,6 +67,21 @@ async function enviar(chatId, texto) {
   }
 }
 
+/** Manda mensagem para alguém da lista USUARIOS (usado pela ferramenta enviar_mensagem). */
+async function enviarParaUsuario(destino, texto) {
+  const perfil = usuario(destino.numero, destino.nome);
+  let jid = perfil.chatId;
+  if (!jid) {
+    // A pessoa ainda não falou com o assistente: procura o número no WhatsApp.
+    const [r] = (await sock?.onWhatsApp(destino.bruto).catch(() => [])) || [];
+    if (!r?.exists) throw new Error(`o número de ${destino.nome} não foi encontrado no WhatsApp (confira em USUARIOS)`);
+    jid = r.jid;
+  }
+  await enviar(jid, texto);
+  console.log(`[mensagem para ${destino.nome}] ${texto.slice(0, 80)}${texto.length > 80 ? '…' : ''}`);
+}
+configurarEnvio(enviarParaUsuario);
+
 async function tratarMensagem(m) {
   const chatId = m.key.remoteJid;
   if (!chatId || chatId.endsWith('@g.us') || chatId === 'status@broadcast') return; // ignora grupos e status
@@ -93,8 +103,13 @@ async function tratarMensagem(m) {
   }
 
   const texto = textoDa(m);
-  if (!texto) {
-    await enviar(chatId, 'Por enquanto eu só entendo mensagens de texto 🙂');
+  const audio = conteudo(m)?.audioMessage;
+  if (!texto && !audio) {
+    await enviar(chatId, 'Por enquanto eu entendo texto e áudio 🙂');
+    return;
+  }
+  if (audio && Number(audio.seconds) > MAX_AUDIO_SEG) {
+    await enviar(chatId, 'Esse áudio é muito longo pra mim. Manda um de até 10 minutos 🙂');
     return;
   }
 
@@ -104,11 +119,21 @@ async function tratarMensagem(m) {
     save();
   }
 
-  console.log(`[recebido de ${quem.nome}] ${texto}`);
+  console.log(`[recebido de ${quem.nome}] ${texto ?? `(áudio de ${audio.seconds || '?'}s)`}`);
   await enfileirar(chatId, async () => {
     await sock.sendPresenceUpdate('composing', chatId).catch(() => {});
     try {
-      const resposta = await responder(quem.numero, texto);
+      let pergunta = texto;
+      if (!pergunta) {
+        const falado = await textoDoAudio(m, audio);
+        console.log(`[áudio de ${quem.nome}] ${falado || '(sem fala)'}`);
+        if (!falado) {
+          await enviar(chatId, 'Não consegui entender esse áudio. Pode mandar de novo?');
+          return;
+        }
+        pergunta = `(áudio) ${falado}`;
+      }
+      const resposta = await responder(quem.numero, pergunta);
       await enviar(chatId, resposta);
       console.log(`[enviado para ${quem.nome}] ${resposta.slice(0, 80)}${resposta.length > 80 ? '…' : ''}`);
     } catch (e) {
@@ -131,7 +156,7 @@ async function conectar() {
   sock = makeWASocket({
     version,
     auth: state,
-    logger: pino({ level: 'silent' }),
+    logger: silencioso,
     browser: ['Assistente', 'Chrome', '1.0'],
     markOnlineOnConnect: false, // não aparece "online" o tempo todo
   });

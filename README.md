@@ -71,6 +71,10 @@ guarda que minha aula na UFU é terça e quinta à noite
 me ajuda a planejar amanhã: tenho estágio de 8h às 14h e preciso estudar 2h
 ```
 
+Também dá pra:
+- **Mandar áudio:** ele transcreve e responde como se fosse texto (até 10 minutos).
+- **Mandar mensagem para outra pessoa da lista `USUARIOS`:** "manda pra Lelê que eu chego às 19h". A pessoa recebe *Mensagem de Ryan:* + o texto. Para quem não está na lista ele não envia.
+
 ## 5. Sem número separado? (modo próprio)
 
 Dá pra rodar no seu próprio WhatsApp: coloque `MODO_PROPRIO=true` no `.env`, escaneie o QR com o seu celular e converse com o assistente na conversa **"Você" / "Mensagem para mim mesmo"**. Ele não responde a nenhuma outra conversa.
@@ -83,7 +87,7 @@ Adicione `,numero:Nome` no fim da linha `USUARIOS` do `.env` e reinicie (`docker
 
 - **Biblioteca não oficial.** O projeto usa a Baileys, que se conecta como "WhatsApp Web". O WhatsApp não autoriza isso oficialmente e **pode banir o número**. O risco é baixo para uso pessoal, com poucas mensagens e só para você, mas existe. Por isso o recomendado é usar um **número separado**, e não o seu principal.
 - **Rodando no PC, ele precisa ficar ligado** para responder e mandar lembretes (na VPS fica 24h). Lembretes que vencerem com ele desligado são enviados assim que voltar. Rotinas e o resumo só são enviados dentro de uma janela de 5 minutos do horário.
-- **Limite grátis do Gemini:** quando acabar, ele avisa no WhatsApp e volta a funcionar no dia seguinte. Se acontecer sempre, troque `MODELO=gemini-2.5-flash-lite` ou passe para o Claude.
+- **Limite grátis do Gemini:** quando acabar, ele avisa no WhatsApp e volta a funcionar no dia seguinte. O padrão já é o modelo leve (`gemini-3.5-flash-lite`); se ainda acontecer sempre, passe para o Claude.
 - **Não compartilhe** as pastas `auth/` e `data/` nem o `.env`. Elas dão acesso ao WhatsApp e à sua chave da API.
 
 ## Problemas comuns
@@ -93,7 +97,7 @@ Adicione `,numero:Nome` no fim da linha `USUARIOS` do `.env` e reinicie (`docker
 | Ele não responde | Veja no terminal se aparece `[ignorado] mensagem de ...`. Se aparecer, copie o número/código mostrado e adicione no `USUARIOS` (ex.: `codigo:Nome`) |
 | "Sessão encerrada no celular" | Apague a pasta `auth/` e rode `npm start` de novo |
 | Erro no `npm install` da Baileys | Confirme que o Node é 20+ (`node --version`) |
-| "Atingi o limite gratuito" | Limite diário do Gemini. Espere, use `MODELO=gemini-2.5-flash-lite` ou troque para o Claude |
+| "Atingi o limite gratuito" | Limite diário do Gemini. Espere ou troque para o Claude |
 | Erro 400/403 do Gemini | Chave errada no `.env` (`GEMINI_API_KEY`) |
 | Erro 404 do Gemini | Nome do modelo mudou: ajuste `MODELO` |
 | Erro 401 da Anthropic | A chave no `.env` está errada |
@@ -101,7 +105,6 @@ Adicione `,numero:Nome` no fim da linha `USUARIOS` do `.env` e reinicie (`docker
 
 ## Próximos passos (planejados)
 
-- Entender **áudios** (transcrição)
 - Integração com **email** (Gmail/Outlook)
 - Integração com o **app da escola**, com aprovação antes de responder os pais
 - Canal do **Telegram**

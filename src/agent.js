@@ -1,11 +1,16 @@
 // Cérebro do assistente: IA (Gemini ou Claude) + ferramentas de tarefas, lembretes, rotinas e notas.
 import { save, nextId, usuario } from './db.js';
 import { DIAS, fmtData, fmtHora, parseLocal } from './tempo.js';
+import { USUARIOS, porNome } from './usuarios.js';
 
 // PROVEDOR=gemini (grátis, com limites) ou PROVEDOR=anthropic (pago, mais confiável)
 export const PROVEDOR = (process.env.PROVEDOR || 'gemini').toLowerCase();
 const MODELO =
-  process.env.MODELO || (PROVEDOR === 'gemini' ? 'gemini-2.5-flash' : 'claude-sonnet-5-5');
+  process.env.MODELO || (PROVEDOR === 'gemini' ? 'gemini-3.5-flash-lite' : 'claude-sonnet-5-5');
+// Modelo usado para entender áudios (sempre Gemini, mesmo com PROVEDOR=anthropic).
+const MODELO_AUDIO = process.env.MODELO_AUDIO || (PROVEDOR === 'gemini' ? MODELO : 'gemini-3.5-flash-lite');
+// Quanto o Gemini "pensa" antes de responder: minimal, low, medium ou high. Menos = mais rápido.
+const PENSAMENTO = (process.env.PENSAMENTO ?? 'low').trim().toLowerCase();
 const MAX_HISTORICO = 30; // mensagens guardadas por conversa (pares usuário/assistente)
 const MAX_PASSOS = 8;     // limite de chamadas de ferramenta por mensagem
 
@@ -95,6 +100,19 @@ const ferramentas = [
     input_schema: { type: 'object', properties: { texto: { type: 'string' } }, required: ['texto'] },
   },
   {
+    name: 'enviar_mensagem',
+    description:
+      'Envia uma mensagem de WhatsApp para outra pessoa cadastrada no assistente. Só funciona para as pessoas da lista informada no prompt. Use quando o usuário pedir para mandar, avisar, falar ou responder algo para alguém da lista. Escreva o texto já pronto para a pessoa ler.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        para: { type: 'string', description: 'Nome da pessoa, exatamente como está na lista' },
+        mensagem: { type: 'string', description: 'Texto que a pessoa vai receber' },
+      },
+      required: ['para', 'mensagem'],
+    },
+  },
+  {
     name: 'remover_nota',
     description: 'Apaga uma nota permanente pelo id.',
     input_schema: { type: 'object', properties: { id: { type: 'integer' } }, required: ['id'] },
@@ -107,7 +125,36 @@ function descreverTarefa(t) {
   return `#${t.id} ${t.feita ? '[feita] ' : ''}${t.titulo}${quando ? ` (${quando})` : ''}`;
 }
 
-function executar(nome, input, u) {
+// O index.js registra aqui a função que manda mensagem pelo WhatsApp.
+let enviarPara = null;
+export function configurarEnvio(fn) {
+  enviarPara = fn;
+}
+
+async function enviarMensagem(input, u) {
+  const destino = porNome(input.para || '');
+  const outros = USUARIOS.filter((x) => x.nome !== u.nome).map((x) => x.nome);
+  if (!destino) return `Erro: "${input.para}" não está na lista. Pode mandar para: ${outros.join(', ') || 'ninguém'}.`;
+  if (destino.nome === u.nome) return 'Erro: essa pessoa é o próprio usuário.';
+  if (!enviarPara) return 'Erro: WhatsApp indisponível agora.';
+  const texto = String(input.mensagem || '').trim();
+  if (!texto) return 'Erro: mensagem vazia.';
+
+  await enviarPara(destino, `*Mensagem de ${u.nome}:*\n${texto}`);
+
+  // Registra no histórico de quem recebeu, para o assistente entender se a pessoa responder.
+  const perfil = usuario(destino.numero, destino.nome);
+  perfil.historico.push(
+    { role: 'user', content: `(aviso automático: ${u.nome} pediu para o assistente te mandar uma mensagem)` },
+    { role: 'assistant', content: `*Mensagem de ${u.nome}:*\n${texto}` }
+  );
+  while (perfil.historico.length > MAX_HISTORICO) perfil.historico.splice(0, 2);
+  save();
+  return `Mensagem enviada para ${destino.nome}.`;
+}
+
+async function executar(nome, input, u) {
+  if (nome === 'enviar_mensagem') return enviarMensagem(input, u);
   const db = u; // dados deste usuário
   if (input.id !== undefined) input.id = Number(input.id);
   if (Array.isArray(input.dias)) input.dias = input.dias.map(Number);
@@ -233,7 +280,9 @@ Como agir:
 - Converta datas relativas ("amanhã", "sexta", "daqui 2 horas") usando a data e hora atuais acima.
 - Se faltar uma informação essencial (ex.: o horário de um lembrete), pergunte antes de criar.
 - Quando ${nome} contar algo que vale lembrar no futuro (horário de trabalho, aulas, preferências), salve como nota.
-- Ao listar coisas, mostre o número (#id) para ele poder dizer "conclui a 3".`;
+- Ao listar coisas, mostre o número (#id) para ele poder dizer "conclui a 3".
+- Você pode mandar mensagem só para estas pessoas: ${USUARIOS.filter((x) => x.nome !== nome).map((x) => x.nome).join(', ') || '(ninguém)'}. Para qualquer outra pessoa, diga que não consegue e ofereça escrever o texto para ${nome} enviar.
+- Se uma mensagem começar com "(áudio)", ela foi transcrita de um áudio: trate como se tivesse sido digitada.`;
 }
 
 // ---------- Conversa ----------
@@ -266,12 +315,11 @@ async function conversarClaude(sistema, historico, texto, u) {
     });
     if (resp.stop_reason !== 'tool_use') break;
     mensagens.push({ role: 'assistant', content: resp.content });
-    const resultados = resp.content
-      .filter((b) => b.type === 'tool_use')
-      .map((b) => {
-        const { saida, erro } = rodarFerramenta(b.name, b.input || {}, u);
-        return { type: 'tool_result', tool_use_id: b.id, content: saida, is_error: erro };
-      });
+    const resultados = [];
+    for (const b of resp.content.filter((x) => x.type === 'tool_use')) {
+      const { saida, erro } = await rodarFerramenta(b.name, b.input || {}, u);
+      resultados.push({ type: 'tool_result', tool_use_id: b.id, content: saida, is_error: erro });
+    }
     mensagens.push({ role: 'user', content: resultados });
   }
   return resp.content
@@ -299,16 +347,69 @@ const declaracoesGemini = ferramentas.map((f) => {
   return d;
 });
 
-async function chamarGemini(corpo) {
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/${MODELO}:generateContent`;
-  const r = await fetch(url, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'x-goog-api-key': process.env.GEMINI_API_KEY },
-    body: JSON.stringify(corpo),
-  });
+// Configuração de "pensamento" (só nos modelos Gemini 3). Se o modelo recusar, desliga e tenta de novo.
+const semPensamento = new Set();
+function configPensamento(modelo) {
+  if (!PENSAMENTO || PENSAMENTO === 'padrao' || semPensamento.has(modelo)) return undefined;
+  if (!/gemini-3/.test(modelo)) return undefined;
+  return { thinkingLevel: PENSAMENTO };
+}
+
+async function chamarGemini(corpo, modelo = MODELO) {
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${modelo}:generateContent`;
+  const pensamento = configPensamento(modelo);
+  const body = pensamento
+    ? { ...corpo, generationConfig: { ...corpo.generationConfig, thinkingConfig: pensamento } }
+    : corpo;
+  let r;
+  try {
+    r = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-goog-api-key': process.env.GEMINI_API_KEY },
+      body: JSON.stringify(body),
+      signal: AbortSignal.timeout(90_000), // não fica travado esperando para sempre
+    });
+  } catch (e) {
+    if (e.name === 'TimeoutError') throw new ErroIA(504, 'Gemini demorou mais de 90s para responder');
+    throw e;
+  }
   const json = await r.json().catch(() => ({}));
-  if (!r.ok) throw new ErroIA(r.status, `Gemini ${r.status}: ${json.error?.message || r.statusText}`);
+  if (!r.ok) {
+    const msg = json.error?.message || r.statusText;
+    if (r.status === 400 && pensamento && /think/i.test(msg)) {
+      console.log(`[aviso] ${modelo} não aceita PENSAMENTO=${PENSAMENTO}; seguindo sem essa configuração.`);
+      semPensamento.add(modelo);
+      return chamarGemini(corpo, modelo);
+    }
+    throw new ErroIA(r.status, `Gemini ${r.status}: ${msg}`);
+  }
   return json;
+}
+
+/** Transcreve um áudio do WhatsApp (sempre pelo Gemini). */
+export async function transcrever(buffer, mimeType = 'audio/ogg') {
+  if (!process.env.GEMINI_API_KEY) throw new ErroIA(400, 'Para entender áudio é preciso GEMINI_API_KEY no .env');
+  const json = await chamarGemini(
+    {
+      contents: [
+        {
+          role: 'user',
+          parts: [
+            { inlineData: { mimeType: mimeType.split(';')[0].trim(), data: buffer.toString('base64') } },
+            { text: 'Transcreva este áudio em português, palavra por palavra. Responda só com a transcrição, sem comentários. Se não houver fala, responda apenas: (sem fala)' },
+          ],
+        },
+      ],
+      generationConfig: { maxOutputTokens: 2000 },
+    },
+    MODELO_AUDIO
+  );
+  const texto = (json.candidates?.[0]?.content?.parts || [])
+    .filter((p) => p.text && !p.thought)
+    .map((p) => p.text)
+    .join('')
+    .trim();
+  return texto === '(sem fala)' ? '' : texto;
 }
 
 async function conversarGemini(sistema, historico, texto, u) {
@@ -329,13 +430,12 @@ async function conversarGemini(sistema, historico, texto, u) {
     const chamadas = partes.filter((p) => p.functionCall);
     if (!chamadas.length) break;
     contents.push(conteudo); // devolve exatamente o que o modelo mandou (inclui assinaturas internas)
-    contents.push({
-      role: 'user',
-      parts: chamadas.map((p) => {
-        const { saida } = rodarFerramenta(p.functionCall.name, p.functionCall.args || {}, u);
-        return { functionResponse: { name: p.functionCall.name, response: { resultado: saida } } };
-      }),
-    });
+    const respostas = [];
+    for (const p of chamadas) {
+      const { saida } = await rodarFerramenta(p.functionCall.name, p.functionCall.args || {}, u);
+      respostas.push({ functionResponse: { name: p.functionCall.name, response: { resultado: saida } } });
+    }
+    contents.push({ role: 'user', parts: respostas });
   }
   return partes
     .filter((p) => p.text && !p.thought)
@@ -344,11 +444,11 @@ async function conversarGemini(sistema, historico, texto, u) {
     .trim();
 }
 
-function rodarFerramenta(nome, input, u) {
+async function rodarFerramenta(nome, input, u) {
   let saida;
   let erro = false;
   try {
-    saida = executar(nome, input, u);
+    saida = await executar(nome, input, u);
   } catch (e) {
     saida = `Erro ao executar ${nome}: ${e.message}`;
     erro = true;
