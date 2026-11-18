@@ -178,6 +178,7 @@ function comandoDoRobo(m, texto) {
   if (/^(status (dos )?cortes|cortes|robô|robo)\s*[?!.]?$/.test(t)) return { acao: 'status' };
   if (/^(log|logs)( do robô| do robo)?\s*[?!.]?$/.test(t)) return { acao: 'log' };
   if (/^(diag|diagn[oó]stico)\s*[?!.]?$/.test(t)) return { acao: 'diag' };
+  if (/^(corte agora|corta agora|cortar agora|testar corte|simular corte|corta isso|clipa isso|clipa)\s*[?!.]?$/.test(t)) return { acao: 'forcar' };
   const r = t.match(/^(ok|aprova(?:do)?|n[aã]o|descarta|postei|postado)\s*#?(\d+)?\s*[.!]?$/);
   if (!r) return null;
   const citado = conteudo(m)?.extendedTextMessage?.contextInfo?.stanzaId;
