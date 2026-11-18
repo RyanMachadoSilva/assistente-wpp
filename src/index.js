@@ -1,10 +1,11 @@
 // Conexão com o WhatsApp (Baileys) + roteamento das mensagens para o assistente.
 import 'dotenv/config'; // precisa ser o primeiro import: carrega o .env antes dos outros módulos
+import http from 'node:http';
 import * as baileys from '@whiskeysockets/baileys';
 import pino from 'pino';
 import qrcode from 'qrcode-terminal';
 import { responder, resumoDoDia, transcrever, configurarEnvio, PROVEDOR } from './agent.js';
-import { USUARIOS, normalizar } from './usuarios.js';
+import { USUARIOS, normalizar, porNome } from './usuarios.js';
 import { iniciarAgendador } from './scheduler.js';
 import { save, usuario } from './db.js';
 
@@ -15,6 +16,11 @@ const { useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion, down
 const silencioso = pino({ level: 'silent' });
 
 const MODO_PROPRIO = process.env.MODO_PROPRIO === 'true';
+
+// Integração com o robô de cortes (opcional): ele manda os cortes por aqui e recebe os comandos ok/não/postei.
+const TOKEN_ROBO = process.env.TOKEN_ROBO || '';
+const ROBO_URL = (process.env.ROBO_URL || 'http://robo:8000').replace(/\/$/, '');
+const PORTA_INTERNA = Number(process.env.PORTA_INTERNA || 3100);
 
 // ---------- Quem pode falar com o assistente ----------
 const numeroDoJid = (jid) => normalizar(String(jid).split('@')[0].split(':')[0]);
@@ -67,16 +73,19 @@ async function enviar(chatId, texto) {
   }
 }
 
+/** Conversa do WhatsApp de alguém da lista USUARIOS. */
+async function jidDe(destino) {
+  const perfil = usuario(destino.numero, destino.nome);
+  if (perfil.chatId) return perfil.chatId;
+  // A pessoa ainda não falou com o assistente: procura o número no WhatsApp.
+  const [r] = (await sock?.onWhatsApp(destino.bruto).catch(() => [])) || [];
+  if (!r?.exists) throw new Error(`o número de ${destino.nome} não foi encontrado no WhatsApp (confira em USUARIOS)`);
+  return r.jid;
+}
+
 /** Manda mensagem para alguém da lista USUARIOS (usado pela ferramenta enviar_mensagem). */
 async function enviarParaUsuario(destino, texto) {
-  const perfil = usuario(destino.numero, destino.nome);
-  let jid = perfil.chatId;
-  if (!jid) {
-    // A pessoa ainda não falou com o assistente: procura o número no WhatsApp.
-    const [r] = (await sock?.onWhatsApp(destino.bruto).catch(() => [])) || [];
-    if (!r?.exists) throw new Error(`o número de ${destino.nome} não foi encontrado no WhatsApp (confira em USUARIOS)`);
-    jid = r.jid;
-  }
+  const jid = await jidDe(destino);
   await enviar(jid, texto);
   console.log(`[mensagem para ${destino.nome}] ${texto.slice(0, 80)}${texto.length > 80 ? '…' : ''}`);
 }
@@ -120,6 +129,16 @@ async function tratarMensagem(m) {
   }
 
   console.log(`[recebido de ${quem.nome}] ${texto ?? `(áudio de ${audio.seconds || '?'}s)`}`);
+
+  const comando = texto && comandoDoRobo(m, texto);
+  if (comando) {
+    await enfileirar(chatId, async () => {
+      const resposta = await falarComRobo(comando);
+      await enviar(chatId, resposta);
+      console.log(`[robô] ${comando.acao} ${comando.id ?? ''} -> ${resposta.slice(0, 60)}`);
+    });
+    return;
+  }
   await enfileirar(chatId, async () => {
     await sock.sendPresenceUpdate('composing', chatId).catch(() => {});
     try {
@@ -147,6 +166,87 @@ async function tratarMensagem(m) {
       await sock.sendPresenceUpdate('paused', chatId).catch(() => {});
     }
   });
+}
+
+// ---------- Robô de cortes ----------
+const cortesEnviados = new Map(); // id da mensagem do vídeo no WhatsApp -> número do corte
+
+/** "ok 12", "não 12", "postei 12" (ou respondendo ao vídeo do corte) e "cortes". */
+function comandoDoRobo(m, texto) {
+  if (!TOKEN_ROBO) return null;
+  const t = texto.trim().toLowerCase();
+  if (/^(status (dos )?cortes|cortes|robô|robo)\s*[?!.]?$/.test(t)) return { acao: 'status' };
+  const r = t.match(/^(ok|aprova(?:do)?|n[aã]o|descarta|postei|postado)\s*#?(\d+)?\s*[.!]?$/);
+  if (!r) return null;
+  const citado = conteudo(m)?.extendedTextMessage?.contextInfo?.stanzaId;
+  const id = r[2] ? Number(r[2]) : cortesEnviados.get(citado);
+  if (!id) return null; // "ok" solto, sem número e sem responder a um corte: conversa normal
+  const acao = { aprova: 'ok', aprovado: 'ok', ok: 'ok', descarta: 'nao', 'não': 'nao', nao: 'nao', postado: 'postei', postei: 'postei' }[r[1]];
+  return { acao, id };
+}
+
+async function falarComRobo(comando) {
+  try {
+    const r = await fetch(`${ROBO_URL}/comando`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Token': TOKEN_ROBO },
+      body: JSON.stringify(comando),
+      signal: AbortSignal.timeout(15_000),
+    });
+    const json = await r.json().catch(() => ({}));
+    return json.texto || `O robô respondeu com erro ${r.status}.`;
+  } catch (e) {
+    return `Não consegui falar com o robô de cortes (${e.message}). Ele está rodando?`;
+  }
+}
+
+/** Porta interna (só na rede do Docker): o robô manda texto ou vídeo para alguém da lista. */
+function iniciarPortaInterna() {
+  if (!TOKEN_ROBO) return;
+  const servidor = http.createServer((req, res) => {
+    const responder_ = (codigo, obj) => {
+      res.writeHead(codigo, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify(obj));
+    };
+    if (req.method !== 'POST' || req.url !== '/enviar' || req.headers['x-token'] !== TOKEN_ROBO) return responder_(403, { erro: 'proibido' });
+    const partes = [];
+    let tamanho = 0;
+    req.on('data', (c) => {
+      tamanho += c.length;
+      if (tamanho > 80 * 1024 * 1024) req.destroy(); // limite de 80 MB
+      else partes.push(c);
+    });
+    req.on('end', async () => {
+      try {
+        const corpo = JSON.parse(Buffer.concat(partes).toString('utf8'));
+        const destino = porNome(corpo.para || '') || USUARIOS[0];
+        if (!destino) return responder_(400, { erro: 'destino não encontrado em USUARIOS' });
+        const jid = await jidDe(destino);
+        let enviada;
+        if (corpo.tipo === 'video' || corpo.tipo === 'documento') {
+          const arquivo = Buffer.from(corpo.arquivo_base64 || '', 'base64');
+          enviada = await sock.sendMessage(
+            jid,
+            corpo.tipo === 'video'
+              ? { video: arquivo, caption: corpo.legenda || '', mimetype: 'video/mp4' }
+              : { document: arquivo, mimetype: 'video/mp4', fileName: corpo.nome || 'corte.mp4', caption: corpo.legenda || '' }
+          );
+          if (corpo.corte_id && enviada?.key?.id) {
+            cortesEnviados.set(enviada.key.id, Number(corpo.corte_id));
+            if (cortesEnviados.size > 300) cortesEnviados.delete(cortesEnviados.keys().next().value);
+          }
+          console.log(`[robô] ${corpo.tipo} enviado para ${destino.nome} (${(arquivo.length / 1e6).toFixed(1)} MB)`);
+        } else {
+          await enviar(jid, String(corpo.texto || ''));
+        }
+        responder_(200, { ok: true });
+      } catch (e) {
+        console.error('[porta interna]', e.message);
+        responder_(500, { erro: e.message });
+      }
+    });
+  });
+  servidor.listen(PORTA_INTERNA, () => console.log(`Porta interna do robô de cortes ouvindo em ${PORTA_INTERNA}`));
 }
 
 async function conectar() {
@@ -206,3 +306,4 @@ if (!USUARIOS.length && !MODO_PROPRIO) {
 
 await conectar();
 iniciarAgendador(enviar, resumoDoDia);
+iniciarPortaInterna();

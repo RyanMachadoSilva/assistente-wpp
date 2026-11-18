@@ -6,6 +6,7 @@ services:
     env_file: .env
     volumes:
       - estado:/app/estado   # sessão do WhatsApp + tarefas/lembretes (não se perde ao atualizar)
+    networks: [robos]        # rede compartilhada com o robô de cortes (porta 3100 só lá dentro)
     restart: unless-stopped
     logging:
       driver: json-file
@@ -15,3 +16,7 @@ services:
 
 volumes:
   estado:
+
+networks:
+  robos:
+    name: robos              # o robo-cortes entra nesta mesma rede
