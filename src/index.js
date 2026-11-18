@@ -134,6 +134,7 @@ async function tratarMensagem(m) {
   if (comando) {
     await enfileirar(chatId, async () => {
       const resposta = await falarComRobo(comando);
+      if (comando.acao === 'confirmar_limpeza' && resposta.startsWith('✅')) cortesEnviados.clear(); // números recomeçam
       await enviar(chatId, resposta);
       console.log(`[robô] ${comando.acao} ${comando.id ?? ''} -> ${resposta.slice(0, 60)}`);
     });
@@ -178,6 +179,8 @@ function comandoDoRobo(m, texto) {
   if (/^(status (dos )?cortes|cortes|robô|robo)\s*[?!.]?$/.test(t)) return { acao: 'status' };
   if (/^(log|logs)( do robô| do robo)?\s*[?!.]?$/.test(t)) return { acao: 'log' };
   if (/^(diag|diagn[oó]stico)\s*[?!.]?$/.test(t)) return { acao: 'diag' };
+  if (/^(limpar|zerar|apagar) (os )?(cortes|v[ií]deos)( da vps)?\s*[?!.]?$/.test(t)) return { acao: 'limpar' };
+  if (/^confirmar limpeza\s*[?!.]?$/.test(t)) return { acao: 'confirmar_limpeza' };
   if (/^(corte agora|corta agora|cortar agora|testar corte|simular corte|corta isso|clipa isso|clipa)\s*[?!.]?$/.test(t)) return { acao: 'forcar' };
   const r = t.match(/^(ok|aprova(?:do)?|n[aã]o|descarta|postei|postado)\s*#?(\d+)?\s*[.!]?$/);
   if (!r) return null;
