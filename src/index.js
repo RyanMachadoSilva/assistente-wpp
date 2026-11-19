@@ -179,6 +179,8 @@ function comandoDoRobo(m, texto) {
   if (/^(status (dos )?cortes|cortes|robô|robo)\s*[?!.]?$/.test(t)) return { acao: 'status' };
   if (/^(log|logs)( do robô| do robo)?\s*[?!.]?$/.test(t)) return { acao: 'log' };
   if (/^(diag|diagn[oó]stico)\s*[?!.]?$/.test(t)) return { acao: 'diag' };
+  if (/^(pausar|pausa|parar|para|desligar|desliga)( o)? (rob[oô]|bot|cortes)( de cortes)?( por enquanto)?\s*[?!.]?$/.test(t)) return { acao: 'pausar' };
+  if (/^(retomar|retoma|voltar|volta|despausar|ligar|liga|continuar|continua)( o)? (rob[oô]|bot|cortes)( de cortes)?\s*[?!.]?$/.test(t)) return { acao: 'retomar' };
   if (/^(limpar|zerar|apagar) (os )?(cortes|v[ií]deos)( da vps)?\s*[?!.]?$/.test(t)) return { acao: 'limpar' };
   if (/^confirmar limpeza\s*[?!.]?$/.test(t)) return { acao: 'confirmar_limpeza' };
   if (/^(corte agora|corta agora|cortar agora|testar corte|simular corte|corta isso|clipa isso|clipa)\s*[?!.]?$/.test(t)) return { acao: 'forcar' };
